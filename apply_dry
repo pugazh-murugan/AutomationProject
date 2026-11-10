@@ -1,0 +1,106 @@
+import re
+from playwright.sync_api import sync_playwright
+
+JOB_ID = "4486114959"
+DRY_RUN = True            # keep True until the dry run looks right
+
+# Answers to common screening questions. Edit these to your real details.
+# If a question isn't matched here, the script stops and tells you.
+ANSWERS = {
+    "notice period": "30",
+    "authorized": "Yes",
+    "sponsorship": "No",
+    "relocate": "Yes",
+    "city": "Bengaluru",
+    # add yours, for example:
+    # "years of experience": "5",
+    # "expected ctc": "...",
+}
+
+LABEL_JS = """e => {
+  const f = e.id && document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+  return ((f && f.innerText) || e.getAttribute('aria-label') || '').trim();
+}"""
+
+
+def answer_for(label):
+    l = label.lower()
+    for key, val in ANSWERS.items():
+        if key in l and val != "":
+            return val
+    return None
+
+
+def fill_dialog(dialog):
+    """Fill empty fields. Returns a list of required questions we couldn't answer."""
+    missing = []
+    for el in dialog.locator("input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio]), textarea").all():
+        if not el.is_visible() or el.input_value().strip():
+            continue
+        label = el.evaluate(LABEL_JS)
+        ans = answer_for(label)
+        print("  field:", label, "->", ans)
+        if ans is None:
+            missing.append(label)
+        else:
+            el.fill(ans)
+    for fs in dialog.locator("fieldset").all():
+        if fs.locator("input[type=radio]:checked").count() or not fs.locator("input[type=radio]").count():
+            continue
+        q = fs.locator("legend, span").first.inner_text().strip()
+        ans = answer_for(q)
+        print("  radio:", q, "->", ans)
+        if ans is None:
+            missing.append(q)
+        else:
+            fs.locator("label").filter(has_text=re.compile(rf"^\s*{ans}\s*$", re.I)).first.click()
+    return missing
+
+
+with sync_playwright() as p:
+    ctx = p.chromium.launch_persistent_context(
+        ".sessions/linkedin", headless=False, no_viewport=True,
+        args=["--start-maximized"],
+    )
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"https://www.linkedin.com/jobs/view/{JOB_ID}/", wait_until="domcontentloaded")
+        page.wait_for_timeout(4000)
+        print("Page:", page.title())
+
+        btn = page.locator("button:has-text('Easy Apply')").first
+        if not btn.is_visible():
+            print("No Easy Apply button (already applied, or external apply).")
+        else:
+            btn.click()
+            dialog = page.locator("div[role=dialog]").first
+            dialog.wait_for(timeout=8000)
+
+            for step in range(1, 11):
+                page.wait_for_timeout(1500)
+                print(f"Step {step}")
+                missing = fill_dialog(dialog)
+                if missing:
+                    print("STOP - add answers for:", missing)
+                    break
+                submit = dialog.get_by_role("button", name=re.compile("submit application", re.I))
+                if submit.count():
+                    print("Reached the Submit step. DRY_RUN =", DRY_RUN)
+                    if not DRY_RUN:
+                        submit.click()
+                        print("Submitted.")
+                    break
+                nxt = dialog.get_by_role("button", name=re.compile(r"^(next|continue|review)", re.I))
+                if not nxt.count():
+                    print("No Next/Review button found.")
+                    break
+                nxt.first.click()
+
+            input("Look at the window, then press Enter to finish... ")
+            # close the form without submitting
+            page.keyboard.press("Escape")
+            discard = page.get_by_role("button", name=re.compile("discard", re.I))
+            if discard.count():
+                discard.first.click()
+    finally:
+        ctx.close()
